@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import os
 import tempfile
@@ -49,16 +50,58 @@ class ApiSettings:
     fast_backbone_decode: bool
     fast_depth_decoder: bool
     fast_codec: bool
+    stream_chunk_frames: int
 
 
 _settings: ApiSettings | None = None
 _request_lock = threading.Lock()
 
 
+async def _acquire_request_slot(timeout: float = 60.0) -> None:
+    """Wait for the single CUDA lane without blocking the ASGI event loop."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not _request_lock.acquire(blocking=False):
+        if loop.time() >= deadline:
+            raise HTTPException(
+                status_code=503,
+                detail="Timed out waiting for the Breeze inference slot.",
+                headers={"Retry-After": "1"},
+            )
+        await asyncio.sleep(0.05)
+
+
 def _pcm16(audio: np.ndarray) -> bytes:
     audio = np.asarray(audio, dtype=np.float32)
     audio = np.clip(audio, -1.0, 1.0)
     return (audio * 32767.0).astype("<i2", copy=False).tobytes()
+
+
+def _iter_pcm_chunks(
+    chunks: Iterator[FastStreamingChunk], *, subsequent_frames: int
+) -> Iterator[bytes]:
+    """Forward the first codec frame immediately, then coalesce later frames."""
+    if subsequent_frames < 1:
+        raise ValueError("subsequent_frames must be positive")
+    first = True
+    pending: list[bytes] = []
+    pending_frames = 0
+    for chunk in chunks:
+        pcm = _pcm16(chunk.audio)
+        if not pcm:
+            continue
+        if first:
+            first = False
+            yield pcm
+            continue
+        pending.append(pcm)
+        pending_frames += int(chunk.codec_frames)
+        if pending_frames >= subsequent_frames:
+            yield b"".join(pending)
+            pending.clear()
+            pending_frames = 0
+    if pending:
+        yield b"".join(pending)
 
 
 def _iter_seeded_audio_chunks(
@@ -173,7 +216,11 @@ app = FastAPI(title="Breeze TTS API", lifespan=_lifespan)
 def health() -> JSONResponse:
     if not hasattr(app.state, "runtime"):
         return JSONResponse({"status": "loading"}, status_code=503)
-    return JSONResponse({"status": "ok", "sample_rate": app.state.runtime.sample_rate})
+    return JSONResponse({
+        "status": "ok",
+        "sample_rate": app.state.runtime.sample_rate,
+        "busy": _request_lock.locked(),
+    })
 
 
 @app.post("/v1/audio/speech")
@@ -185,10 +232,7 @@ async def speech(
     ref_text: str = Form(""),
     seed: int = Form(42),
 ) -> StreamingResponse:
-    if not _request_lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409, detail="An inference request is already running."
-        )
+    await _acquire_request_slot()
 
     reference_path: Path | None = None
     try:
@@ -238,21 +282,64 @@ async def speech(
         _request_lock.release()
         raise
 
-    def body() -> Iterator[bytes]:
+    loop = asyncio.get_running_loop()
+    output: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+    cancelled = threading.Event()
+
+    def emit(kind: str, value: object) -> None:
         try:
-            for chunk in _iter_seeded_audio_chunks(
+            loop.call_soon_threadsafe(output.put_nowait, (kind, value))
+        except RuntimeError:
+            pass
+
+    def generate() -> None:
+        chunks = _iter_pcm_chunks(
+            _iter_seeded_audio_chunks(
                 app.state.runtime,
                 inputs,
                 request_id=request_id,
                 seed=seed,
-            ):
-                pcm = _pcm16(chunk.audio)
-                if pcm:
-                    yield pcm
+            ),
+            subsequent_frames=_settings.stream_chunk_frames,
+        )
+        try:
+            for pcm in chunks:
+                if cancelled.is_set():
+                    break
+                emit("data", pcm)
+        except Exception as exc:  # noqa: BLE001 - propagate worker failures to ASGI
+            emit("error", exc)
         finally:
-            if reference_path is not None:
-                reference_path.unlink(missing_ok=True)
-            _request_lock.release()
+            try:
+                chunks.close()
+            finally:
+                if reference_path is not None:
+                    reference_path.unlink(missing_ok=True)
+                _request_lock.release()
+                emit("done", None)
+
+    worker = threading.Thread(
+        target=generate, name=f"breeze-{request_id}", daemon=True)
+    worker.start()
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            while True:
+                kind, value = await output.get()
+                if kind == "done":
+                    return
+                if kind == "error":
+                    if not isinstance(value, BaseException):
+                        raise RuntimeError("Breeze worker returned an invalid error")
+                    raise value
+                if not isinstance(value, bytes):
+                    raise TypeError("Breeze worker returned a non-bytes PCM chunk")
+                yield value
+        finally:
+            # A Python thread cannot be interrupted inside a CUDA kernel. It
+            # observes cancellation after the current acoustic frame, closes
+            # the model iterator, and releases the single-request slot.
+            cancelled.set()
 
     return StreamingResponse(
         body(),
@@ -260,6 +347,8 @@ async def speech(
         headers={
             "X-Sample-Rate": str(app.state.runtime.sample_rate),
             "X-Sample-Format": "s16le",
+            "X-Initial-Codec-Frames": "1",
+            "X-Subsequent-Codec-Frames": str(_settings.stream_chunk_frames),
             "Cache-Control": "no-store",
         },
     )
@@ -288,9 +377,24 @@ def main() -> None:
         "--fast-depth-decoder", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument(
+        "--depth-mode",
+        choices=("cached", "compiled"),
+        default="cached",
+        help=("Mac-streaming-equivalent depth path: cached reuses per-frame KV; "
+              "compiled additionally captures the unrolled CUDA loop"),
+    )
+    parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--stream-chunk-frames",
+        type=int,
+        default=2,
+        help="PCM transport chunk size after the immediate one-frame first chunk",
+    )
     args = parser.parse_args()
+    if args.stream_chunk_frames < 1:
+        parser.error("--stream-chunk-frames must be positive")
 
     global _settings
     _settings = ApiSettings(
@@ -299,8 +403,9 @@ def main() -> None:
         fast_text_encoder=args.fast_text_encoder,
         fast_backbone_prefill=args.fast_backbone_prefill,
         fast_backbone_decode=args.fast_backbone_decode,
-        fast_depth_decoder=args.fast_depth_decoder,
+        fast_depth_decoder=(args.fast_depth_decoder or args.depth_mode == "compiled"),
         fast_codec=args.fast_codec,
+        stream_chunk_frames=args.stream_chunk_frames,
     )
 
     import uvicorn

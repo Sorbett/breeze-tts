@@ -1,5 +1,6 @@
 runs/
 outputs/
+.venv/
 warmup_manifest.json
 *.wav
 

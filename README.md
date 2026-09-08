@@ -149,6 +149,29 @@ Start the single-concurrency streaming API. It uses the same PyTorch runtime and
 python -m breeze_infer.api ../breeze-tts-2 --host 0.0.0.0 --port 7860
 ```
 
+The generator and codec advance one acoustic frame at a time. The first PCM
+frame is sent immediately; later frames are grouped in pairs by default to
+reduce transport overhead without delaying first audio. Adjust only the later
+transport grouping with `--stream-chunk-frames N`.
+
+The CUDA depth loop follows the same strategy as the MLX Mac streaming port:
+one per-frame prefill, KV reuse for the remaining codebooks, one host read after
+the complete frame, and incremental codec decoding. `--depth-mode cached` is
+the eager CUDA implementation; `--depth-mode compiled` additionally captures
+the unrolled depth loop as a CUDA graph after warmup.
+
+This checkout also provides a local launcher. It defaults to compiled depth
+after the first-run benchmark showed that cached depth could not sustain
+real-time playback on the target CUDA host:
+
+```bash
+./run_cuda_stream.sh
+```
+
+Override deployment details without editing source via `BREEZE_MODEL_DIR`,
+`BREEZE_CUDA_DEVICE`, `BREEZE_HOST`, `BREEZE_PORT`, `BREEZE_DEPTH_MODE`, and
+`BREEZE_STREAM_CHUNK_FRAMES`.
+
 Send a Voice Direction request with reference audio and CFG 4:
 
 ```bash

@@ -1,3 +1,14 @@
+"""Frame-streaming CUDA runtime for Breeze TTS 2.
+
+The cached path is the PyTorch/CUDA counterpart of the depth optimization in
+``BreezeTTS2_Mac_Streaming``: prefill a frame's depth decoder once, reuse KV for
+the remaining codebooks, keep sampled codes on-device until the frame is
+complete, and hand one complete frame to the incremental codec.  CUDA uses a
+Transformers ``StaticCache`` and can optionally capture the unrolled loop;
+those are backend-specific equivalents of the MLX append-only cache and
+compiled frame function.
+"""
+
 from __future__ import annotations
 
 import json
@@ -182,7 +193,12 @@ class FastBreezeStreamingRuntime:
         self._fast_depth_decoder = self.config.stage_fast("depth_decoder")
         self._fast_codec = self.config.stage_fast("codec")
         self.model._fast_text_encoder_cudagraph = self._fast_text_encoder
-        self._codec_chunk_frames = 1 if self._fast_codec else 2
+        # Decode the first acoustic frame as soon as it is available. The
+        # previous eager path waited for two frames, putting an avoidable full
+        # backbone/depth step on TTFA. Keep codec state at one-frame steps and
+        # let the transport coalesce later chunks; this matches the MLX stream
+        # shape (first frame immediately, larger payloads afterwards).
+        self._codec_chunk_frames = 1
         self.device = _get_device(model)
         self.dtype = _get_dtype(model)
         self._backbone_graph: BackboneGraph | None = None

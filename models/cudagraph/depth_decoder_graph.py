@@ -169,9 +169,13 @@ class DepthDecoderGraph:
             torch._dynamo.config.cache_size_limit = max(
                 torch._dynamo.config.cache_size_limit, _limit
             )
-            torch._dynamo.config.recompile_limit = max(
-                torch._dynamo.config.recompile_limit, _limit
-            )
+            # recompile_limit was added after Torch 2.6. cache_size_limit is
+            # sufficient for the CUDA 12.4-compatible runtime used on older
+            # drivers; newer Torch releases get both guards.
+            if hasattr(torch._dynamo.config, "recompile_limit"):
+                torch._dynamo.config.recompile_limit = max(
+                    torch._dynamo.config.recompile_limit, _limit
+                )
             already_compiled = hasattr(self.depth_model.layers[0], "_orig_mod")
             if already_compiled:
                 _log.info("Depth decoder layers already compiled, skipping.")
